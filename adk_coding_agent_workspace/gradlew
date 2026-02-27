@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Minimal placeholder gradlew for milestone.
+# Replace with a real Gradle wrapper for full fidelity.
+echo "This is a placeholder gradlew. Install Gradle and run: gradle test"
+exit 2
