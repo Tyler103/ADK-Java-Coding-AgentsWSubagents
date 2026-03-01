@@ -1,5 +1,9 @@
-#!/usr/bin/env bash
-# Minimal placeholder gradlew for milestone.
-# Replace with a real Gradle wrapper for full fidelity.
-echo "This is a placeholder gradlew. Install Gradle and run: gradle test"
-exit 2
+#!/usr/bin/env sh
+
+if [ "$JAVA_HOME" ]; then
+  export PATH="$JAVA_HOME/bin:$PATH"
+fi
+
+DEFAULT_JVM_OPTS='"-Xmx64m" "-Xms64m"'
+
+exec java $DEFAULT_JVM_OPTS -jar "$(dirname "$0")"/gradle/wrapper/gradle-wrapper.jar "$@"

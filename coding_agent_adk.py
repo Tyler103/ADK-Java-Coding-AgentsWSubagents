@@ -17,6 +17,9 @@ Notes:
 
 from __future__ import annotations
 
+from dotenv import load_dotenv
+load_dotenv()
+
 import asyncio
 import os
 import subprocess
@@ -31,6 +34,12 @@ from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.adk.tools.tool_context import ToolContext
 
+import asyncio
+from google.adk.agents import BaseAgent
+
+PROJECT_DIR = "adk_coding_agent_workspace"
+
+print("API KEY LOADED:", bool(os.getenv("GOOGLE_API_KEY")))
 
 # ----------------------------
 # "MCP-like" tools (local)
@@ -92,6 +101,42 @@ def run_shell_command(
 
     return result
 
+def local_gradle_test_check() -> bool:
+    """
+    Runs Gradle tests locally before invoking any LLM.
+    Returns True if tests pass, False otherwise.
+    """
+    print("\n🔎 Running local pre-check: gradle clean test --no-daemon\n")
+
+    env = os.environ.copy()
+
+    # Use Homebrew OpenJDK 17 explicitly (you already have it)
+    env["JAVA_HOME"] = "/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home"
+    env["PATH"] = env["JAVA_HOME"] + "/bin:" + env.get("PATH", "")
+
+    cmd = "gradle clean test --no-daemon"
+    proc = subprocess.run(
+        cmd,
+        cwd=PROJECT_DIR,
+        shell=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    print("---- stdout (tail) ----")
+    print(proc.stdout[-2000:])
+    print("---- stderr (tail) ----")
+    print(proc.stderr[-2000:])
+    print("exit code:", proc.returncode)
+
+    return proc.returncode == 0
+
+class SleepAgent(BaseAgent):
+    async def _run_async_impl(self, ctx):
+        await asyncio.sleep(20)
+        return
+    
 
 # ----------------------------
 # Custom checker + escalate
@@ -127,7 +172,7 @@ class CheckResultAndEscalate(BaseAgent):
 # LLM agent prompts
 # ----------------------------
 
-PROJECT_DIR = "adk_coding_agent_workspace"
+
 
 FIRST_VERSION_INSTRUCTIONS = f"""
 You are a coding agent.
@@ -149,6 +194,7 @@ Requirements:
 You MUST create files by calling the tool write_text_file(path, content).
 Do not print the full files in chat; write them to disk via the tool.
 """
+
 
 JUNIT_SETUP_AND_TESTS_INSTRUCTIONS = f"""
 You are the "JUnit5 setup + unit-tests development" agent.
@@ -175,13 +221,13 @@ You are the "Run unit tests with MCP tools for compilation and run" agent.
 
 Task:
 - Run unit tests using the tool run_shell_command.
-- Prefer:
-    1) cd {PROJECT_DIR} && ./gradlew test
-- If ./gradlew isn't executable, run:
-    chmod +x {PROJECT_DIR}/gradlew
-    then run tests again.
+- Use system Gradle (NOT ./gradlew), because this milestone uses a placeholder wrapper.
+- Run:
+    1) cd {PROJECT_DIR} && gradle clean test --no-daemon
+- If it fails, rerun with:
+    2) cd {PROJECT_DIR} && gradle clean test --no-daemon --stacktrace
 - Store results in session state (tool does this automatically).
-Return a short summary of pass/fail.
+Return a short summary of pass/fail and the key error lines.
 """
 
 IMPROVE_CODE_INSTRUCTIONS = f"""
@@ -252,7 +298,7 @@ MIN_WRAPPER_PROPS = """distributionUrl=https\\://services.gradle.org/distributio
 # Build the agent tree
 # ----------------------------
 
-def build_root_agent() -> SequentialAgent:
+def build_root_agent(include_first_version: bool) -> SequentialAgent:
     # LLM agent #1: write the first version of code
     first_version_agent = LlmAgent(
         name="first_version_llm",
@@ -280,29 +326,34 @@ def build_root_agent() -> SequentialAgent:
     )
 
     checker_agent = CheckResultAndEscalate(name="check_and_escalate")
+    sleep_1 = SleepAgent(name="sleep_1")
+    sleep_2 = SleepAgent(name="sleep_2")
+    sleep_3 = SleepAgent(name="sleep_3")
 
     loop_agent = LoopAgent(
         name="coding_loop",
-        max_iterations=20,
+        max_iterations=3,
         sub_agents=[
             junit_agent,
+            sleep_1,
             run_tests_agent,
+            sleep_2,
             improve_agent,
+            sleep_3,
             checker_agent,
         ],
     )
+    
+    # ✅ Conditionally include first_version_agent
+    agents = []
+    if include_first_version:
+        agents.append(first_version_agent)
+    agents.append(loop_agent)
 
-    # Root sequential agent: first draft -> loop
-    root = SequentialAgent(
+    return SequentialAgent(
         name="root_sequential",
-        sub_agents=[
-            first_version_agent,
-            loop_agent,
-        ],
+        sub_agents=agents,
     )
-
-    return root
-
 
 # ----------------------------
 # Bootstrap: seed minimal files
@@ -332,7 +383,27 @@ async def seed_minimal_project_files():
 
 
 async def main():
-    root_agent = build_root_agent()
+    DISABLE_LLM = False
+
+    """ if DISABLE_LLM:
+        print("🚫 LLM disabled. Fix local Gradle failure first.")
+    return"""
+    
+    # 1️⃣ First: local check BEFORE creating ADK agents
+    if os.path.exists(PROJECT_DIR):
+        tests_pass = local_gradle_test_check()
+
+        if tests_pass:
+            print("\n✅ Tests already pass locally.")
+            print("🚫 Skipping ADK LLM execution to save API quota.")
+            print("Workspace:", os.path.abspath(PROJECT_DIR))
+            return
+        else:
+            print("\n❌ Tests failing. Running ADK agent to fix...")
+
+    # 2️⃣ Only build agents if needed
+    include_first = not os.path.exists(PROJECT_DIR)
+    root_agent = build_root_agent(include_first_version=include_first)
 
     # --- Session Management ---
     session_service = InMemorySessionService()
@@ -360,23 +431,33 @@ async def main():
         role="user",
         parts=[types.Part(text="Build the Java Calculator project and make tests pass.")]
     )
+    from google.adk.models.google_llm import _ResourceExhaustedError
+    from google.genai.errors import ClientError
 
-    async for event in runner.run_async(
-        new_message=user_msg,
-        user_id=USER_ID,
-        session_id=SESSION_ID,
-    ):
-        author = getattr(event, "author", "unknown")
-        text = ""
-        try:
-            if event.content and event.content.parts:
-                text = "".join([p.text or "" for p in event.content.parts])[:3000]
-        except Exception:
-            pass
+    try:
+        async for event in runner.run_async(
+            new_message=user_msg,
+            user_id=USER_ID,
+            session_id=SESSION_ID,
+        ):
+            author = getattr(event, "author", "unknown")
+            text = ""
+            try:
+                if event.content and event.content.parts:
+                    text = "".join([p.text or "" for p in event.content.parts])[:3000]
+            except Exception:
+                pass
 
-        if text.strip():
-            print(f"\n[{author}] {text}")
-
+            if text.strip():
+                print(f"\n[{author}] {text}")
+    
+    except _ResourceExhaustedError as e:
+        print("\n⚠️ Gemini quota/rate limit hit (429).")
+        print("Tip: run again after the retryDelay shown in the error, or reduce LLM calls.")
+        return
+    except ClientError as e:
+        print("\n⚠️ Gemini ClientError:", e)
+        return
     # Fetch updated session state at end
     updated_session = await session_service.get_session(
         app_name=APP_NAME,
