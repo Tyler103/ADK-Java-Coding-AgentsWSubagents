@@ -69,6 +69,8 @@ You should see something like:
 
 API KEY LOADED: True
 
+get key from https://aistudio.google.com/app/api-keys?project=gen-lang-client-0887563574
+
 
 7) Running agent:
 
