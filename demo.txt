@@ -1,0 +1,291 @@
+ADK JAVA CODING AGENT – FULL WORKFLOW EXPLANATION
+==================================================
+
+OVERVIEW
+--------
+This project implements a self-improving Java coding agent using
+Google ADK (Agent Development Kit).
+
+The system autonomously:
+1) Generates Java code
+2) Sets up JUnit tests
+3) Compiles and runs tests via Gradle
+4) Reads failures
+5) Improves the code
+6) Repeats until tests pass or maximum iterations reached
+
+The architecture follows the required milestone structure:
+
+SequentialAgent(
+    LlmAgent(first version),
+    LoopAgent(max_iterations)[
+        LlmAgent(JUnit setup),
+        LlmAgent(run tests),
+        LlmAgent(improve code),
+        CheckResultAndEscalate
+    ]
+)
+
+------------------------------------------------------------
+
+PHASE 0 — LOCAL PRE-CHECK (Cost Optimization)
+----------------------------------------------
+Before invoking any LLM, the system runs:
+
+    gradle clean test --no-daemon
+
+If tests already pass:
+    - ADK execution is skipped
+    - No API calls are made
+    - Quota is saved
+
+This makes the system efficient and production-aware.
+
+
+------------------------------------------------------------
+
+PHASE 1 — BOOTSTRAP WORKSPACE
+------------------------------
+Function: seed_minimal_project_files()
+
+Creates baseline project structure:
+
+    src/main/java/example
+    src/test/java/example
+    gradle/wrapper
+
+Writes minimal:
+    settings.gradle
+    build.gradle
+    gradlew scripts
+
+Purpose:
+    - Provide stable directory structure
+    - Prevent hallucinated paths
+    - Reduce repair cycles
+    - Improve determinism
+
+
+------------------------------------------------------------
+
+PHASE 2 — RUNNER STARTS EXECUTION
+----------------------------------
+Runner launches the root agent with a user instruction:
+
+    "Build the Java Calculator project and make tests pass."
+
+Execution now follows the agent tree.
+
+
+------------------------------------------------------------
+
+PHASE 3 — SEQUENTIAL AGENT
+---------------------------
+
+Structure:
+
+SequentialAgent(
+    [optional] first_version_llm,
+    coding_loop
+)
+
+If project does NOT exist:
+    first_version_llm runs once.
+
+If project already exists:
+    skip generation and go straight to loop.
+
+
+------------------------------------------------------------
+
+PHASE 4 — FIRST VERSION LLM (Optional)
+---------------------------------------
+Agent: first_version_llm
+
+Responsibilities:
+    - Write Calculator.java
+    - Write Main.java
+    - Create baseline project files
+
+Uses tools:
+    write_text_file
+    read_text_file
+
+This creates the initial draft of the Java project.
+
+
+------------------------------------------------------------
+
+PHASE 5 — LOOP AGENT (CORE REPAIR ENGINE)
+------------------------------------------
+
+LoopAgent(max_iterations = 3)
+
+Each iteration executes the following sequence:
+
+1) junit5_setup_and_tests_llm
+2) sleep_agent
+3) run_tests_llm
+4) sleep_agent
+5) improve_code_llm
+6) sleep_agent
+7) check_and_escalate
+
+
+------------------------------------------------------------
+
+STEP 5.1 — JUNIT SETUP AGENT
+-----------------------------
+Ensures:
+    - JUnit 5 dependency exists in build.gradle
+    - Test files exist
+    - Test structure is valid
+
+Writes or fixes:
+    CalculatorTest.java
+    build.gradle
+
+Goal:
+    Ensure test environment is correct before running tests.
+
+
+------------------------------------------------------------
+
+STEP 5.2 — RUN TESTS AGENT
+---------------------------
+Uses tool:
+
+    run_shell_command("gradle clean test --no-daemon")
+
+Captures:
+    exit code
+    stdout
+    stderr
+
+Stores results in session state:
+
+    tests_passed
+    last_exit_code
+    last_stdout
+    last_stderr
+
+
+------------------------------------------------------------
+
+STEP 5.3 — IMPROVE CODE AGENT
+------------------------------
+Reads:
+    - Failing test output
+    - Current Java source files
+
+Modifies:
+    Calculator.java
+    Other source files as needed
+
+Purpose:
+    Fix logic errors based on actual test failures.
+
+This is the "self-healing" component.
+
+
+------------------------------------------------------------
+
+STEP 5.4 — CHECK AND ESCALATE
+------------------------------
+Reads:
+
+    session.state["tests_passed"]
+
+If True:
+    Stop loop early.
+
+If False:
+    Continue to next iteration.
+
+Loop stops when:
+    - Tests pass
+    OR
+    - max_iterations reached.
+
+
+------------------------------------------------------------
+
+SLEEP AGENTS (RATE LIMIT CONTROL)
+----------------------------------
+SleepAgent instances are inserted between LLM calls.
+
+Reason:
+    Free-tier Gemini allows limited calls per minute.
+    Prevents 429 RESOURCE_EXHAUSTED errors.
+
+Each SleepAgent must:
+    - Have a unique name
+    - Not be reused (ADK enforces single parent rule)
+
+
+------------------------------------------------------------
+
+FINAL STATE REPORTING
+----------------------
+After execution, session state is fetched:
+
+    tests_passed
+    last_exit_code
+    workspace path
+
+This verifies:
+    - Whether compilation succeeded
+    - Whether tests passed
+    - Final system state
+
+
+------------------------------------------------------------
+
+SYSTEM ARCHITECTURE SUMMARY
+---------------------------
+
+User Instruction
+    ↓
+SequentialAgent
+    ↓
+[Optional] First Version LLM
+    ↓
+LoopAgent (max 3 iterations)
+    ↓
+  ├── JUnit Setup LLM
+  ├── Run Tests (tool boundary)
+  ├── Improve Code LLM
+  └── CheckResultAndEscalate
+
+
+------------------------------------------------------------
+
+WHAT THIS PROJECT DEMONSTRATES
+-------------------------------
+
+This system is not a single LLM call.
+
+It demonstrates:
+
+✔ Structured multi-agent orchestration
+✔ Tool-based environment interaction
+✔ Test-driven iterative refinement
+✔ Session-state memory tracking
+✔ Controlled termination logic
+✔ Rate-limit mitigation
+✔ Cost-aware execution
+
+It is a minimal example of a self-improving coding agent.
+
+
+------------------------------------------------------------
+
+SHORT PRESENTATION SUMMARY
+---------------------------
+
+This project implements a SequentialAgent that optionally generates
+an initial Java project and then enters a LoopAgent that iteratively
+sets up tests, runs them via Gradle, analyzes failures, and improves
+the code until tests pass. The system integrates tool execution,
+state tracking, and termination control to create a self-healing
+software engineering agent.
