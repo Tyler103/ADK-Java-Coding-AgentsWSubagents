@@ -101,6 +101,8 @@ def run_shell_command(
 
     return result
 
+# Runs gradle tests locally before calling any llm
+
 def local_gradle_test_check() -> bool:
     """
     Runs Gradle tests locally before invoking any LLM.
@@ -110,10 +112,12 @@ def local_gradle_test_check() -> bool:
 
     env = os.environ.copy()
 
-    # Use Homebrew OpenJDK 17 explicitly (you already have it)
+    # made sure that we are using correct jdk version(17)
     env["JAVA_HOME"] = "/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home"
     env["PATH"] = env["JAVA_HOME"] + "/bin:" + env.get("PATH", "")
 
+    # run command to clean gradle enviroment
+    # ensures a clean build
     cmd = "gradle clean test --no-daemon"
     proc = subprocess.run(
         cmd,
@@ -132,6 +136,7 @@ def local_gradle_test_check() -> bool:
 
     return proc.returncode == 0
 
+# spaces out LLM calls
 class SleepAgent(BaseAgent):
     async def _run_async_impl(self, ctx):
         await asyncio.sleep(20)
@@ -299,40 +304,71 @@ MIN_WRAPPER_PROPS = """distributionUrl=https\\://services.gradle.org/distributio
 # ----------------------------
 
 def build_root_agent(include_first_version: bool) -> SequentialAgent:
-    # LLM agent #1: write the first version of code
+    
+    # -----------------------------
+    # 1) First-pass generation agent
+    # -----------------------------
+    # This agent is responsible for creating the initial Java project skeleton:
+    # - src/main/java/example/Calculator.java
+    # - src/main/java/example/Main.java
+    # - baseline Gradle setup, etc.
+    # It writes files using the write_text_file tool instead of printing code to chat.
+
     first_version_agent = LlmAgent(
         name="first_version_llm",
         instruction=FIRST_VERSION_INSTRUCTIONS,
         tools=[write_text_file, read_text_file],  # allow writing files
     )
 
-    # Loop sub-agents
+    # --------------------------------
+    # 2) Loop sub-agents (repair cycle)
+    # --------------------------------
+    # This agent ensures the JUnit 5 test harness and Gradle config exist and are correct.
+    # It can update build.gradle/settings.gradle and create CalculatorTest.java.
     junit_agent = LlmAgent(
         name="junit5_setup_and_tests_llm",
         instruction=JUNIT_SETUP_AND_TESTS_INSTRUCTIONS,
         tools=[write_text_file, read_text_file],
     )
 
+    # This agent runs the unit tests through a tool boundary (run_shell_command).
+    # “MCP tools for compilation and run”.
     run_tests_agent = LlmAgent(
         name="run_tests_llm",
         instruction=RUN_TESTS_INSTRUCTIONS,
         tools=[run_shell_command],
     )
 
+    # This agent reads the last test output (stdout/stderr/exit code in session state)
+    # and makes targeted edits to the Java production code to fix failing tests.
     improve_agent = LlmAgent(
         name="improve_code_llm",
         instruction=IMPROVE_CODE_INSTRUCTIONS,
         tools=[write_text_file, read_text_file],
     )
 
+
+
+    # This agent checks session.state["tests_passed"] and escalates (stops the loop)
+    # when tests succeed.
     checker_agent = CheckResultAndEscalate(name="check_and_escalate")
+
+
+    # add sleeper agents to pause execution
+    # only got 5 llm calls per minute 
+    # had to save resources
     sleep_1 = SleepAgent(name="sleep_1")
     sleep_2 = SleepAgent(name="sleep_2")
     sleep_3 = SleepAgent(name="sleep_3")
 
+    # -----------------------------
+    # LoopAgent: iterative repair
+    # -----------------------------
+    # Runs up to max_iterations times, executing the same sub-agent sequence each cycle:
+    #   junit setup -> sleep -> run tests -> sleep -> improve code -> sleep -> check+stop?
     loop_agent = LoopAgent(
         name="coding_loop",
-        max_iterations=3,
+        max_iterations=20,
         sub_agents=[
             junit_agent,
             sleep_1,
@@ -350,14 +386,30 @@ def build_root_agent(include_first_version: bool) -> SequentialAgent:
         agents.append(first_version_agent)
     agents.append(loop_agent)
 
+    # Return the root SequentialAgent as the top-level agent to pass into Runner(...)
     return SequentialAgent(
         name="root_sequential",
         sub_agents=agents,
     )
 
-# ----------------------------
-# Bootstrap: seed minimal files
-# ----------------------------
+    """
+    Creates a minimal Java + Gradle project structure BEFORE the LLM runs.
+
+    Why this exists:
+    ----------------
+    Instead of letting the LLM guess folder structure from scratch,
+    we create a stable workspace baseline.
+
+    This reduces:
+    - hallucinated paths
+    - missing directories
+    - broken Gradle wrapper issues
+    - unnecessary LLM repair cycles
+    - API cost
+
+    The JUnit/setup agent can later modify or replace these files
+    if needed.
+    """
 
 async def seed_minimal_project_files():
     """
@@ -393,6 +445,7 @@ async def main():
     if os.path.exists(PROJECT_DIR):
         tests_pass = local_gradle_test_check()
 
+        # test pass, no futher reasoning required
         if tests_pass:
             print("\n✅ Tests already pass locally.")
             print("🚫 Skipping ADK LLM execution to save API quota.")
@@ -402,7 +455,11 @@ async def main():
             print("\n❌ Tests failing. Running ADK agent to fix...")
 
     # 2️⃣ Only build agents if needed
+
+    # checks: Does the Java workspace folder already exist?
     include_first = not os.path.exists(PROJECT_DIR)
+
+    # use original version to save resources 
     root_agent = build_root_agent(include_first_version=include_first)
 
     # --- Session Management ---
